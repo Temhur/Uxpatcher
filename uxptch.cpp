@@ -9,12 +9,9 @@
 #include <unordered_set>
 #include <cstdint>
 #include <filesystem>
-#include <algorithm>
 
 #pragma comment(lib, "Dbghelp.lib")
 #pragma comment(lib, "Advapi32.lib")
-
-using namespace std::literals;
 
 static std::vector<uint8_t> read_all(const std::filesystem::path& path) {
     std::ifstream is(path, std::ios::binary);
@@ -52,31 +49,25 @@ static uint32_t rva2fo(const uint8_t* image, uint32_t rva) {
     return 0;
 }
 
-// Try to enable SeTakeOwnershipPrivilege and set owner to Administrators (best-effort).
 static bool TakeOwnership(const wchar_t* path) {
-    bool ok = false;
     HANDLE hToken = nullptr;
     if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
         TOKEN_PRIVILEGES tp{};
         LUID luid;
-        if (LookupPrivilegeValueW(nullptr, SE_TAKE_OWNERSHIP_NAME, &luid)) {
+        // Use wide-string privilege name
+        if (LookupPrivilegeValueW(nullptr, L"SeTakeOwnershipPrivilege", &luid)) {
             tp.PrivilegeCount = 1;
             tp.Privileges[0].Luid = luid;
             tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
             AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
-            if (GetLastError() == ERROR_SUCCESS) {
-                ok = true; // we enabled privilege (may still fail when setting owner)
-            }
         }
         CloseHandle(hToken);
     }
 
-    // Build Administrators SID
     BYTE sidBuf[SECURITY_MAX_SID_SIZE];
     PSID adminSid = sidBuf;
     DWORD sidSize = sizeof(sidBuf);
     if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, adminSid, &sidSize)) {
-        // fallback: try current user
         adminSid = nullptr;
     }
 
@@ -90,7 +81,6 @@ static BOOL CALLBACK EnumSymCallback(PSYMBOL_INFOW sym, ULONG /*symSize*/, PVOID
     if (!sym || !sym->Name || !ctx) return TRUE;
     auto set = reinterpret_cast<std::unordered_set<uint32_t>*>(ctx);
 
-    // Look for either undecorated "CThemeSignature::Verify" or decorated names that include "CThemeSignature" & "Verify"
     if (wcscmp(sym->Name, L"CThemeSignature::Verify") == 0 ||
         (wcsstr(sym->Name, L"CThemeSignature") && wcsstr(sym->Name, L"Verify"))) {
         uint64_t addr = sym->Address;
@@ -126,15 +116,14 @@ int wmain(int argc, wchar_t* argv[]) {
         return 1;
     }
 
-    // Set symbol options BEFORE SymInitialize
+    // Symbol options
     DWORD opts = SymGetOptions();
     opts |= SYMOPT_UNDNAME;
     opts |= SYMOPT_DEFERRED_LOADS;
     opts |= SYMOPT_LOAD_LINES;
     SymSetOptions(opts);
 
-    // Optional: set symbol search path (attempt to download MS public symbols)
-    // Comment out if no network access desired.
+    // Optional symbol server path (comment out if not needed)
     SymSetSearchPathW(GetCurrentProcess(), L"SRV*C:\\symbols*https://msdl.microsoft.com/download/symbols");
 
     if (!SymInitializeW(GetCurrentProcess(), nullptr, FALSE)) {
@@ -178,15 +167,8 @@ int wmain(int argc, wchar_t* argv[]) {
         return 1;
     }
 
-#if defined(_M_IX86)
-    constexpr static uint8_t patch[] = { 0x31, 0xC0, 0xC2, 0x08, 0x00 }; // xor eax,eax; ret 8
-#elif defined(_M_AMD64)
-    constexpr static uint8_t patch[] = { 0x31, 0xC0, 0xC3 }; // xor eax,eax; ret
-#elif defined(_M_ARM64)
-    constexpr static uint8_t patch[] = { 0x00,0x00,0x80,0x52, 0xC0,0x03,0x5F,0xD6 }; // mov w0,#0; ret
-#else
-    #error Unsupported architecture
-#endif
+    // x64 patch only
+    constexpr static uint8_t patch[] = { 0x31, 0xC0, 0xC3 }; // xor eax,eax ; ret
 
     unsigned patched = 0;
     for (auto rva : patch_rvas) {
@@ -211,7 +193,6 @@ int wmain(int argc, wchar_t* argv[]) {
         return static_cast<int>(patch_rvas.size());
     }
 
-    // Write .patched file
     std::filesystem::path patched_path = file_path;
     patched_path += L".patched";
     std::filesystem::path backup_path = file_path;
@@ -225,13 +206,10 @@ int wmain(int argc, wchar_t* argv[]) {
         return 1;
     }
 
-    // Try take ownership (best-effort)
     if (!TakeOwnership(fullpath)) {
         std::wcerr << L"TakeOwnership failed: " << GetLastError() << L"\n";
-        // continue anyway
     }
 
-    // Move original to backup
     if (!MoveFileW(fullpath, backup_path.c_str())) {
         std::wcerr << L"MoveFileW " << fullpath << L" -> " << backup_path.c_str() << L" failed: " << GetLastError() << L"\n";
         SymUnloadModule64(GetCurrentProcess(), load_base);
@@ -240,10 +218,8 @@ int wmain(int argc, wchar_t* argv[]) {
         return 1;
     }
 
-    // Replace with patched
     if (!MoveFileW(patched_path.c_str(), fullpath)) {
         std::wcerr << L"MoveFileW " << patched_path.c_str() << L" -> " << fullpath << L" failed: " << GetLastError() << L"\n";
-        // Attempt to restore backup
         if (!MoveFileW(backup_path.c_str(), fullpath)) {
             std::wcerr << L"MoveFileW " << backup_path.c_str() << L" -> " << fullpath << L" failed: " << GetLastError() << L". This is pretty bad!\n";
         }
