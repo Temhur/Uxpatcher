@@ -1,45 +1,50 @@
-name: Build uxptch (MSVC x64 safe stub)
+name: Build Uxpatcher (MSVC)
 
 on:
   push:
-    branches: [ main ]
-  workflow_dispatch:
+    paths:
+      - 'uxptch.cpp'
+      - '.github/workflows/**'
+  pull_request:
+    paths:
+      - 'uxptch.cpp'
+      - '.github/workflows/**'
 
 jobs:
-  build-windows-msvc:
-    runs-on: windows-2022
+  build-windows:
+    name: Build on Windows (x64)
+    runs-on: windows-latest
+
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download Visual Studio Build Tools
+      - name: Locate Visual Studio (vswhere) and show info
         shell: powershell
         run: |
-          Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vs_BuildTools.exe" -OutFile vs_BuildTools.exe
+          Write-Host "Buscando instalación de Visual Studio..."
+          $vs = &"${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Visual Studio no encontrado en el runner." }
+          Write-Host "Visual Studio encontrado en: $vs"
+          Write-Host "VS version:"
+          & "$vs\Common7\Tools\VsDevCmd.bat" -help | Select-Object -First 20
 
-      - name: Install Visual Studio Build Tools (VC + SDK)
+      - name: Build with MSVC (cl.exe)
         shell: powershell
         run: |
-          Start-Process -FilePath .\vs_BuildTools.exe -ArgumentList @(
-            "--quiet","--wait","--norestart","--nocache",
-            "--installPath","C:\BuildTools",
-            "--add","Microsoft.VisualStudio.Workload.VCTools",
-            "--add","Microsoft.VisualStudio.Component.Windows10SDK.19041.x64",
-            "--includeRecommended"
-          ) -NoNewWindow -Wait
+          # Preparar entorno de compilador para x64
+          $vs = &"${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          & "$vs\Common7\Tools\VsDevCmd.bat" -arch=amd64
 
-      - name: Setup x64 environment
-        shell: cmd
-        run: |
-          call "C:\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64
-          if errorlevel 1 exit /b 1
+          # Ajusta el nombre/ubicación si tu fuente no está en la raíz
+          Write-Host "Compilando uxptch.cpp..."
+          cl.exe /EHsc /std:c++17 /O2 uxptch.cpp Dbghelp.lib /Fe:uxptch.exe
 
-      - name: Compile uxptch.exe with MSVC
-        shell: cmd
-        run: |
-          cl /nologo /EHsc /O2 /MD uxptch.cpp /Fe:uxptch.exe
-          if errorlevel 1 exit /b 1
+          Write-Host "Contenido del directorio:"
+          dir
 
-      - name: Show produced file
-        shell: cmd
-        run: dir uxptch.exe
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: uxptch-windows-x64
+          path: uxptch.exe
