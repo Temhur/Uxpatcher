@@ -2,7 +2,6 @@
 #include <DbgHelp.h>
 
 #include <vector>
-#include <string>
 #include <fstream>
 #include <iostream>
 #include <unordered_set>
@@ -32,12 +31,11 @@ static uint32_t rva2fo(const uint8_t* image, uint32_t rva) {
     if (!image) return 0;
     auto idh = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
     if (idh->e_magic != IMAGE_DOS_SIGNATURE) return 0;
-    // compute NT headers base (cast away const for IMAGE_FIRST_SECTION macro)
-    auto inh = reinterpret_cast<PIMAGE_NT_HEADERS>(const_cast<uint8_t*>(image) + idh->e_lfanew);
+    auto inh = reinterpret_cast<const IMAGE_NT_HEADERS*>(image + idh->e_lfanew);
     if (inh->Signature != IMAGE_NT_SIGNATURE) return 0;
     auto sections = IMAGE_FIRST_SECTION(inh);
     for (int i = 0; i < inh->FileHeader.NumberOfSections; ++i) {
-        auto& sec = sections[i];
+        const auto& sec = sections[i];
         uint32_t secVA = sec.VirtualAddress;
         uint32_t secSize = sec.SizeOfRawData ? sec.SizeOfRawData : sec.Misc.VirtualSize;
         if (sec.PointerToRawData && secVA <= rva && rva < secVA + secSize)
@@ -81,7 +79,6 @@ int wmain(int argc, wchar_t* argv[]) {
         return 1;
     }
 
-    // ensure undecorated names are available
     DWORD opts = SymGetOptions();
     opts |= SYMOPT_UNDNAME;
     SymSetOptions(opts);
@@ -92,7 +89,6 @@ int wmain(int argc, wchar_t* argv[]) {
         return 1;
     }
 
-    // load module for symbol handling
     DWORD64 load_base = SymLoadModuleExW(GetCurrentProcess(), nullptr, fullpath, nullptr, reinterpret_cast<DWORD64>(lib), 0, nullptr, 0);
     if (load_base == 0) {
         std::wcerr << L"SymLoadModuleExW failed: " << GetLastError() << L"\n";
@@ -102,9 +98,8 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     std::unordered_set<uint32_t> patch_rvas;
-    // Use SymEnumSymbolsExW similarly to the provided reference
-    if (!SymEnumSymbolsExW(GetCurrentProcess(), reinterpret_cast<DWORD64>(lib), nullptr, EnumSymCallback, &patch_rvas, SYMENUM_OPTIONS_DEFAULT)) {
-        std::wcerr << L"SymEnumSymbolsExW failed: " << GetLastError() << L"\n";
+    if (!SymEnumSymbolsW(GetCurrentProcess(), load_base, nullptr, EnumSymCallback, &patch_rvas)) {
+        std::wcerr << L"SymEnumSymbolsW failed: " << GetLastError() << L"\n";
         SymUnloadModule64(GetCurrentProcess(), load_base);
         SymCleanup(GetCurrentProcess());
         FreeLibrary(lib);
@@ -129,13 +124,11 @@ int wmain(int argc, wchar_t* argv[]) {
         return 1;
     }
 
-    // x64 patch only
-    constexpr static uint8_t patch[] = { 0x31, 0xC0, 0xC3 }; // xor eax,eax ; ret
+    constexpr static uint8_t patch[] = { 0x31, 0xC0, 0xC3 }; // xor eax,eax ; ret (x64)
 
     bool wrote = false;
     for (auto rva : patch_rvas) {
         uint32_t fo = rva2fo(file.data(), rva);
-        std::wcout << L"found at rva " << std::hex << rva << L" file offset " << fo << std::dec << L"\n";
         if (fo == 0) continue;
         if (static_cast<size_t>(fo) + sizeof(patch) > file.size()) continue;
         if (0 != memcmp(file.data() + fo, patch, sizeof(patch))) {
@@ -159,8 +152,6 @@ int wmain(int argc, wchar_t* argv[]) {
         FreeLibrary(lib);
         return 1;
     }
-
-    std::wcout << L"Patched file written to: " << out_path << L"\n";
 
     SymUnloadModule64(GetCurrentProcess(), load_base);
     SymCleanup(GetCurrentProcess());
