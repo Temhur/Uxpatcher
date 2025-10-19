@@ -31,9 +31,11 @@ bool write_all(const std::filesystem::path& path, const void* data, size_t size)
 
 // RVA a FileOffset
 uint32_t rva2fo(const uint8_t* image, uint32_t rva) {
-    auto idh = reinterpret_cast<PIMAGE_DOS_HEADER>(const_cast<uint8_t*>(image));
+    if (!image) return 0;
+    auto idh = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
     if (idh->e_magic != IMAGE_DOS_SIGNATURE) return 0;
-    auto inh = reinterpret_cast<PIMAGE_NT_HEADERS>(image + idh->e_lfanew);
+    // cast to non-const for NT headers/sections computation
+    auto inh = reinterpret_cast<PIMAGE_NT_HEADERS>(const_cast<uint8_t*>(image) + idh->e_lfanew);
     if (inh->Signature != IMAGE_NT_SIGNATURE) return 0;
     auto sections = IMAGE_FIRST_SECTION(inh);
     for (int i = 0; i < inh->FileHeader.NumberOfSections; ++i) {
@@ -65,7 +67,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    wchar_t dll_path_w[MAX_PATH];
+    wchar_t dll_path_w[MAX_PATH]{};
     MultiByteToWideChar(CP_UTF8, 0, argv[1], -1, dll_path_w, MAX_PATH);
 
     HMODULE lib = LoadLibraryExW(dll_path_w, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
@@ -74,7 +76,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    wchar_t full_path_w[MAX_PATH];
+    wchar_t full_path_w[MAX_PATH]{};
     if (!GetModuleFileNameW(lib, full_path_w, MAX_PATH)) {
         std::wcerr << L"GetModuleFileNameW fallo: " << GetLastError() << L"\n";
         return 1;
@@ -126,7 +128,7 @@ int main(int argc, char* argv[]) {
             std::wcout << L"No se pudo convertir RVA " << std::hex << rva << L" a file offset\n";
             continue;
         }
-        if (fo + sizeof(patch) <= file.size()) {
+        if (static_cast<size_t>(fo) + sizeof(patch) <= file.size()) {
             memcpy(file.data() + fo, patch, sizeof(patch));
             std::wcout << L"Patched RVA " << std::hex << rva << L" at file offset " << fo << L"\n";
         } else {
@@ -136,7 +138,7 @@ int main(int argc, char* argv[]) {
 
     std::filesystem::path out_path;
     {
-        wchar_t out_path_w[MAX_PATH];
+        wchar_t out_path_w[MAX_PATH]{};
         MultiByteToWideChar(CP_UTF8, 0, argv[2], -1, out_path_w, MAX_PATH);
         out_path = out_path_w;
     }
