@@ -23,12 +23,12 @@ jobs:
       - name: Validate source file
         shell: cmd
         run: |
-          if not exist uxptch.cpp exit /b 1
+          if not exist "uxptch.cpp" exit /b 1
 
       - name: Build uxptch.exe
         shell: cmd
         run: |
-          cl /nologo /EHsc /O2 /MD uxptch.cpp dbghelp.lib /Fe:uxptch.exe
+          cl /nologo /EHsc /O2 /MD "uxptch.cpp" dbghelp.lib /Fe:uxptch.exe
           if errorlevel 1 exit /b 1
 
       - name: Upload artifact: exe
