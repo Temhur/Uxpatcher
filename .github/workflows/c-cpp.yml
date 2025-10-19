@@ -19,28 +19,38 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Locate Visual Studio (vswhere) and show info
+      - name: Find Visual Studio installation
+        id: find_vs
         shell: powershell
         run: |
-          Write-Host "Buscando instalación de Visual Studio..."
           $vs = &"${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          if (-not $vs) { throw "Visual Studio no encontrado en el runner." }
+          if (-not $vs) {
+            Write-Error "Visual Studio no encontrado en el runner."
+            exit 1
+          }
+          # Exponer como output para pasos siguientes
+          Add-Content -Path $env:GITHUB_OUTPUT -Value "vs_path=$vs"
           Write-Host "Visual Studio encontrado en: $vs"
-          Write-Host "VS version:"
-          & "$vs\Common7\Tools\VsDevCmd.bat" -help | Select-Object -First 20
 
       - name: Build with MSVC (cl.exe)
-        shell: powershell
+        # Use cmd so we can 'call' the batch file and preserve its environment for the same shell session
+        shell: cmd
+        env:
+          VS_PATH: ${{ steps.find_vs.outputs.vs_path }}
         run: |
-          # Preparar entorno de compilador para x64
-          $vs = &"${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
-          & "$vs\Common7\Tools\VsDevCmd.bat" -arch=amd64
-
-          # Ajusta el nombre/ubicación si tu fuente no está en la raíz
-          Write-Host "Compilando uxptch.cpp..."
+          echo Preparando entorno de Visual Studio desde "%VS_PATH%"
+          call "%VS_PATH%\Common7\Tools\VsDevCmd.bat" -arch=amd64
+          if errorlevel 1 (
+            echo VsDevCmd falló
+            exit /b 1
+          )
+          echo Compilando uxptch.cpp...
           cl.exe /EHsc /std:c++17 /O2 uxptch.cpp Dbghelp.lib /Fe:uxptch.exe
-
-          Write-Host "Contenido del directorio:"
+          if errorlevel 1 (
+            echo Compilación falló
+            exit /b 1
+          )
+          echo Resultado del directorio:
           dir
 
       - name: Upload build artifact
