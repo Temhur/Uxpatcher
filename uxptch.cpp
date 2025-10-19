@@ -1,5 +1,7 @@
 #include <Windows.h>
 #include <DbgHelp.h>
+#include <Aclapi.h>
+
 #include <vector>
 #include <string>
 #include <fstream>
@@ -7,11 +9,14 @@
 #include <unordered_set>
 #include <cstdint>
 #include <filesystem>
+#include <algorithm>
 
 #pragma comment(lib, "Dbghelp.lib")
+#pragma comment(lib, "Advapi32.lib")
 
-// Leer todo el archivo a un vector
-std::vector<uint8_t> read_all(const std::filesystem::path& path) {
+using namespace std::literals;
+
+static std::vector<uint8_t> read_all(const std::filesystem::path& path) {
     std::ifstream is(path, std::ios::binary);
     if (!is) return {};
     is.seekg(0, std::ios::end);
@@ -21,37 +26,73 @@ std::vector<uint8_t> read_all(const std::filesystem::path& path) {
     return data;
 }
 
-// Guardar buffer a archivo
-bool write_all(const std::filesystem::path& path, const void* data, size_t size) {
+static bool write_all(const std::filesystem::path& path, const void* data, size_t size) {
     std::ofstream os(path, std::ios::binary);
     if (!os) return false;
     os.write(reinterpret_cast<const char*>(data), size);
     return os.good();
 }
 
-// RVA a FileOffset
-uint32_t rva2fo(const uint8_t* image, uint32_t rva) {
+static uint32_t rva2fo(const uint8_t* image, uint32_t rva) {
     if (!image) return 0;
     auto idh = reinterpret_cast<const IMAGE_DOS_HEADER*>(image);
     if (idh->e_magic != IMAGE_DOS_SIGNATURE) return 0;
-    // cast to non-const for NT headers/sections computation
-    auto inh = reinterpret_cast<PIMAGE_NT_HEADERS>(const_cast<uint8_t*>(image) + idh->e_lfanew);
+    const uint8_t* ntBase = image + idh->e_lfanew;
+    auto inh = reinterpret_cast<const IMAGE_NT_HEADERS*>(ntBase);
     if (inh->Signature != IMAGE_NT_SIGNATURE) return 0;
     auto sections = IMAGE_FIRST_SECTION(inh);
     for (int i = 0; i < inh->FileHeader.NumberOfSections; ++i) {
-        auto& sec = sections[i];
+        const auto& sec = sections[i];
         uint32_t secVA = sec.VirtualAddress;
         uint32_t secSize = sec.SizeOfRawData ? sec.SizeOfRawData : sec.Misc.VirtualSize;
-        if (sec.PointerToRawData && secVA <= rva && rva < secVA + secSize)
+        if (sec.PointerToRawData && secVA <= rva && rva < secVA + secSize) {
             return rva - secVA + sec.PointerToRawData;
+        }
     }
     return 0;
 }
 
+// Try to enable SeTakeOwnershipPrivilege and set owner to Administrators (best-effort).
+static bool TakeOwnership(const wchar_t* path) {
+    bool ok = false;
+    HANDLE hToken = nullptr;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
+        TOKEN_PRIVILEGES tp{};
+        LUID luid;
+        if (LookupPrivilegeValueW(nullptr, SE_TAKE_OWNERSHIP_NAME, &luid)) {
+            tp.PrivilegeCount = 1;
+            tp.Privileges[0].Luid = luid;
+            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+            if (GetLastError() == ERROR_SUCCESS) {
+                ok = true; // we enabled privilege (may still fail when setting owner)
+            }
+        }
+        CloseHandle(hToken);
+    }
+
+    // Build Administrators SID
+    BYTE sidBuf[SECURITY_MAX_SID_SIZE];
+    PSID adminSid = sidBuf;
+    DWORD sidSize = sizeof(sidBuf);
+    if (!CreateWellKnownSid(WinBuiltinAdministratorsSid, nullptr, adminSid, &sidSize)) {
+        // fallback: try current user
+        adminSid = nullptr;
+    }
+
+    DWORD res = SetNamedSecurityInfoW(const_cast<LPWSTR>(path), SE_FILE_OBJECT,
+        OWNER_SECURITY_INFORMATION, adminSid, nullptr, nullptr, nullptr);
+
+    return (res == ERROR_SUCCESS);
+}
+
 static BOOL CALLBACK EnumSymCallback(PSYMBOL_INFOW sym, ULONG /*symSize*/, PVOID ctx) {
+    if (!sym || !sym->Name || !ctx) return TRUE;
     auto set = reinterpret_cast<std::unordered_set<uint32_t>*>(ctx);
-    if (!sym || !set) return TRUE;
-    if (wcscmp(sym->Name, L"CThemeSignature::Verify") == 0) {
+
+    // Look for either undecorated "CThemeSignature::Verify" or decorated names that include "CThemeSignature" & "Verify"
+    if (wcscmp(sym->Name, L"CThemeSignature::Verify") == 0 ||
+        (wcsstr(sym->Name, L"CThemeSignature") && wcsstr(sym->Name, L"Verify"))) {
         uint64_t addr = sym->Address;
         uint64_t modBase = sym->ModBase;
         if (addr >= modBase) {
@@ -61,98 +102,162 @@ static BOOL CALLBACK EnumSymCallback(PSYMBOL_INFOW sym, ULONG /*symSize*/, PVOID
     return TRUE;
 }
 
-int main(int argc, char* argv[]) {
+int wmain(int argc, wchar_t* argv[]) {
     if (argc != 3) {
-        std::cout << "Uso: uxptch.exe <DLL origen> <DLL salida>\n";
+        std::wcout << L"Uso: uxptch.exe <DLL origen> <DLL salida>\n";
         return 1;
     }
 
-    wchar_t dll_path_w[MAX_PATH]{};
-    MultiByteToWideChar(CP_UTF8, 0, argv[1], -1, dll_path_w, MAX_PATH);
+    const wchar_t* dll_path = argv[1];
+    const wchar_t* out_path_arg = argv[2];
 
-    HMODULE lib = LoadLibraryExW(dll_path_w, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    std::wcout << L"Trying image " << dll_path << L"\n";
+
+    HMODULE lib = LoadLibraryExW(dll_path, nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!lib) {
-        std::wcerr << L"LoadLibraryExW fallo: " << GetLastError() << L"\n";
+        std::wcerr << L"LoadLibraryExW failed: " << GetLastError() << L"\n";
         return 1;
     }
 
-    wchar_t full_path_w[MAX_PATH]{};
-    if (!GetModuleFileNameW(lib, full_path_w, MAX_PATH)) {
-        std::wcerr << L"GetModuleFileNameW fallo: " << GetLastError() << L"\n";
+    wchar_t fullpath[MAX_PATH]{};
+    if (!GetModuleFileNameW(lib, fullpath, (DWORD)std::size(fullpath))) {
+        std::wcerr << L"GetModuleFileNameW failed: " << GetLastError() << L"\n";
+        FreeLibrary(lib);
         return 1;
     }
+
+    // Set symbol options BEFORE SymInitialize
+    DWORD opts = SymGetOptions();
+    opts |= SYMOPT_UNDNAME;
+    opts |= SYMOPT_DEFERRED_LOADS;
+    opts |= SYMOPT_LOAD_LINES;
+    SymSetOptions(opts);
+
+    // Optional: set symbol search path (attempt to download MS public symbols)
+    // Comment out if no network access desired.
+    SymSetSearchPathW(GetCurrentProcess(), L"SRV*C:\\symbols*https://msdl.microsoft.com/download/symbols");
 
     if (!SymInitializeW(GetCurrentProcess(), nullptr, FALSE)) {
-        std::wcerr << L"SymInitializeW fallo: " << GetLastError() << L"\n";
+        std::wcerr << L"SymInitializeW failed: " << GetLastError() << L"\n";
+        FreeLibrary(lib);
         return 1;
     }
 
-    DWORD64 base = SymLoadModuleExW(GetCurrentProcess(), nullptr, full_path_w, nullptr, reinterpret_cast<DWORD64>(lib), 0, nullptr, 0);
-    if (!base) {
-        std::wcerr << L"SymLoadModuleExW fallo: " << GetLastError() << L"\n";
+    DWORD64 load_base = SymLoadModuleExW(GetCurrentProcess(), nullptr, fullpath, nullptr, reinterpret_cast<DWORD64>(lib), 0, nullptr, 0);
+    if (load_base == 0) {
+        std::wcerr << L"SymLoadModuleExW failed: " << GetLastError() << L"\n";
         SymCleanup(GetCurrentProcess());
+        FreeLibrary(lib);
         return 1;
     }
 
     std::unordered_set<uint32_t> patch_rvas;
-
-    if (!SymEnumSymbolsW(GetCurrentProcess(), base, nullptr, EnumSymCallback, &patch_rvas)) {
-        std::wcerr << L"SymEnumSymbolsW fallo: " << GetLastError() << L"\n";
-        SymUnloadModule64(GetCurrentProcess(), base);
+    if (!SymEnumSymbolsW(GetCurrentProcess(), load_base, nullptr, EnumSymCallback, &patch_rvas)) {
+        std::wcerr << L"SymEnumSymbolsW failed: " << GetLastError() << L"\n";
+        SymUnloadModule64(GetCurrentProcess(), load_base);
         SymCleanup(GetCurrentProcess());
+        FreeLibrary(lib);
         return 1;
     }
 
     if (patch_rvas.empty()) {
         std::wcerr << L"No se encontro CThemeSignature::Verify\n";
-        SymUnloadModule64(GetCurrentProcess(), base);
+        SymUnloadModule64(GetCurrentProcess(), load_base);
         SymCleanup(GetCurrentProcess());
+        FreeLibrary(lib);
         return 1;
     }
 
-    std::filesystem::path full_path(full_path_w);
-    auto file = read_all(full_path);
+    std::filesystem::path file_path(fullpath);
+    auto file = read_all(file_path);
     if (file.empty()) {
-        std::wcerr << L"No se pudo leer el archivo\n";
-        SymUnloadModule64(GetCurrentProcess(), base);
+        std::wcerr << L"can't read file\n";
+        SymUnloadModule64(GetCurrentProcess(), load_base);
         SymCleanup(GetCurrentProcess());
+        FreeLibrary(lib);
         return 1;
     }
 
-    // Patch x64: xor eax,eax ; ret  -> 31 C0 C3
-    uint8_t patch[] = { 0x31, 0xC0, 0xC3 };
+#if defined(_M_IX86)
+    constexpr static uint8_t patch[] = { 0x31, 0xC0, 0xC2, 0x08, 0x00 }; // xor eax,eax; ret 8
+#elif defined(_M_AMD64)
+    constexpr static uint8_t patch[] = { 0x31, 0xC0, 0xC3 }; // xor eax,eax; ret
+#elif defined(_M_ARM64)
+    constexpr static uint8_t patch[] = { 0x00,0x00,0x80,0x52, 0xC0,0x03,0x5F,0xD6 }; // mov w0,#0; ret
+#else
+    #error Unsupported architecture
+#endif
 
+    unsigned patched = 0;
     for (auto rva : patch_rvas) {
         uint32_t fo = rva2fo(file.data(), rva);
-        if (!fo) {
-            std::wcout << L"No se pudo convertir RVA " << std::hex << rva << L" a file offset\n";
+        std::wcout << L"found at rva " << std::hex << rva << L" file offset " << fo << std::dec << L"\n";
+        if (fo == 0) continue;
+        if (static_cast<size_t>(fo) + sizeof(patch) > file.size()) {
+            std::wcerr << L"Patch would go out of bounds, skipping\n";
             continue;
         }
-        if (static_cast<size_t>(fo) + sizeof(patch) <= file.size()) {
+        if (0 != memcmp(file.data() + fo, patch, sizeof(patch))) {
             memcpy(file.data() + fo, patch, sizeof(patch));
-            std::wcout << L"Patched RVA " << std::hex << rva << L" at file offset " << fo << L"\n";
-        } else {
-            std::wcout << L"Patch fuera de rango para RVA " << std::hex << rva << L"\n";
+            ++patched;
         }
     }
 
-    std::filesystem::path out_path;
-    {
-        wchar_t out_path_w[MAX_PATH]{};
-        MultiByteToWideChar(CP_UTF8, 0, argv[2], -1, out_path_w, MAX_PATH);
-        out_path = out_path_w;
+    if (patched == 0) {
+        std::wcout << L"file already patched!\n";
+        SymUnloadModule64(GetCurrentProcess(), load_base);
+        SymCleanup(GetCurrentProcess());
+        FreeLibrary(lib);
+        return static_cast<int>(patch_rvas.size());
     }
 
-    if (!write_all(out_path, file.data(), file.size())) {
-        std::wcerr << L"No se pudo escribir archivo de salida\n";
-        SymUnloadModule64(GetCurrentProcess(), base);
+    // Write .patched file
+    std::filesystem::path patched_path = file_path;
+    patched_path += L".patched";
+    std::filesystem::path backup_path = file_path;
+    backup_path += L".bak";
+
+    if (!write_all(patched_path, file.data(), file.size())) {
+        std::wcerr << L"write_all failed\n";
+        SymUnloadModule64(GetCurrentProcess(), load_base);
         SymCleanup(GetCurrentProcess());
+        FreeLibrary(lib);
         return 1;
     }
 
-    std::wcout << L"Archivo parcheado guardado en: " << out_path.wstring() << L"\n";
+    // Try take ownership (best-effort)
+    if (!TakeOwnership(fullpath)) {
+        std::wcerr << L"TakeOwnership failed: " << GetLastError() << L"\n";
+        // continue anyway
+    }
 
-    SymUnloadModule64(GetCurrentProcess(), base);
+    // Move original to backup
+    if (!MoveFileW(fullpath, backup_path.c_str())) {
+        std::wcerr << L"MoveFileW " << fullpath << L" -> " << backup_path.c_str() << L" failed: " << GetLastError() << L"\n";
+        SymUnloadModule64(GetCurrentProcess(), load_base);
+        SymCleanup(GetCurrentProcess());
+        FreeLibrary(lib);
+        return 1;
+    }
+
+    // Replace with patched
+    if (!MoveFileW(patched_path.c_str(), fullpath)) {
+        std::wcerr << L"MoveFileW " << patched_path.c_str() << L" -> " << fullpath << L" failed: " << GetLastError() << L"\n";
+        // Attempt to restore backup
+        if (!MoveFileW(backup_path.c_str(), fullpath)) {
+            std::wcerr << L"MoveFileW " << backup_path.c_str() << L" -> " << fullpath << L" failed: " << GetLastError() << L". This is pretty bad!\n";
+        }
+        SymUnloadModule64(GetCurrentProcess(), load_base);
+        SymCleanup(GetCurrentProcess());
+        FreeLibrary(lib);
+        return 1;
+    }
+
+    std::wcout << L"Patched file saved to: " << fullpath << L"\n";
+
+    SymUnloadModule64(GetCurrentProcess(), load_base);
     SymCleanup(GetCurrentProcess());
-    return 0;
+    FreeLibrary(lib);
+
+    return static_cast<int>(patch_rvas.size());
 }
