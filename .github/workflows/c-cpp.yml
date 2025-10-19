@@ -1,4 +1,4 @@
-name: Build uxptch (Windows x64)
+name: Build uxptch (MSVC x64 safe stub)
 
 on:
   push:
@@ -6,31 +6,40 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-windows:
+  build-windows-msvc:
     runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Visual Studio Build Tools
-        shell: cmd
+      - name: Download Visual Studio Build Tools
+        shell: powershell
         run: |
-          curl -Lo vs_BuildTools.exe https://aka.ms/vs/17/release/vs_BuildTools.exe
-          vs_BuildTools.exe --quiet --wait --norestart --nocache --installPath C:\BuildTools --add Microsoft.VisualStudio.Workload.VCTools --add Microsoft.VisualStudio.Component.Windows10SDK.19041.x64 --includeRecommended
+          Invoke-WebRequest -Uri "https://aka.ms/vs/17/release/vs_BuildTools.exe" -OutFile vs_BuildTools.exe
 
-      - name: Setup x64 build environment
+      - name: Install Visual Studio Build Tools (VC + SDK)
+        shell: powershell
+        run: |
+          Start-Process -FilePath .\vs_BuildTools.exe -ArgumentList @(
+            "--quiet","--wait","--norestart","--nocache",
+            "--installPath","C:\BuildTools",
+            "--add","Microsoft.VisualStudio.Workload.VCTools",
+            "--add","Microsoft.VisualStudio.Component.Windows10SDK.19041.x64",
+            "--includeRecommended"
+          ) -NoNewWindow -Wait
+
+      - name: Setup x64 environment
         shell: cmd
         run: |
-          call "C:\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+          call "C:\BuildTools\VC\Auxiliary\Build\vcvarsall.bat" x64
           if errorlevel 1 exit /b 1
 
-      - name: Validate source file
+      - name: Compile uxptch.exe with MSVC
         shell: cmd
         run: |
-          if not exist "uxptch.cpp" exit /b 1
-
-      - name: Build uxptch.exe
-        shell: cmd
-        run: |
-          cl /nologo /EHsc /O2 /MD "uxptch.cpp" dbghelp.lib /Fe:uxptch.exe
+          cl /nologo /EHsc /O2 /MD uxptch.cpp /Fe:uxptch.exe
           if errorlevel 1 exit /b 1
+
+      - name: Show produced file
+        shell: cmd
+        run: dir uxptch.exe
