@@ -12,69 +12,27 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Show runner info
-        run: |
-          echo RUNNER_OS=%RUNNER_OS%
-          ver
-
-      - name: Locate Visual Studio (vswhere) and setup x64 environment
+      - name: Locate Visual Studio and setup x64 environment
         shell: cmd
         run: |
-          rem find latest VS installation with VC tools
           for /f "usebackq delims=" %%I in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSROOT=%%I"
-          if not defined VSROOT (
-            echo ERROR: vswhere did not find Visual Studio with VC tools.
-            exit /b 1
-          )
-          echo Visual Studio found at: %VSROOT%
-
-          rem setup x64 build env
+          if not defined VSROOT exit /b 1
           call "%VSROOT%\VC\Auxiliary\Build\vcvarsall.bat" x64
-          if errorlevel 1 (
-            echo ERROR: vcvarsall failed.
-            exit /b 1
-          )
-          set
+          if errorlevel 1 exit /b 1
 
-      - name: Validate source file exists
+      - name: Validate source file
         shell: cmd
         run: |
-          if not exist uxptch.cpp (
-            echo ERROR: uxptch.cpp not found in repo root.
-            dir
-            exit /b 1
-          )
+          if not exist uxptch.cpp exit /b 1
 
-      - name: Build uxptch.exe (MSVC x64)
+      - name: Build uxptch.exe
         shell: cmd
         run: |
-          rem compile with optimization and link dbghelp
           cl /nologo /EHsc /O2 /MD uxptch.cpp dbghelp.lib /Fe:uxptch.exe
-          if errorlevel 1 (
-            echo Build failed.
-            exit /b 1
-          )
-          echo Build succeeded.
-          dir uxptch.exe
-
-      - name: Create zip artifact
-        shell: PowerShell
-        run: |
-          $out = 'uxptch-win-x64'
-          if (Test-Path $out) { Remove-Item -Recurse -Force $out }
-          New-Item -ItemType Directory -Path $out | Out-Null
-          Copy-Item uxptch.exe $out
-          Compress-Archive -Path $out -DestinationPath $out + '.zip' -Force
-          Write-Host "Created $(Resolve-Path $out).zip"
+          if errorlevel 1 exit /b 1
 
       - name: Upload artifact: exe
         uses: actions/upload-artifact@v4
         with:
           name: uxptch-win-x64-exe
           path: uxptch.exe
-
-      - name: Upload artifact: zip
-        uses: actions/upload-artifact@v4
-        with:
-          name: uxptch-win-x64-zip
-          path: uxptch-win-x64.zip
